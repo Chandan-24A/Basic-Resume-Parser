@@ -1,0 +1,229 @@
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import multer from 'multer';
+import { PDFParse } from 'pdf-parse';
+import Groq from 'groq-sdk';
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Groq client
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY || '',
+});
+
+// File upload configuration
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed'), false);
+    }
+  },
+});
+
+//extract JSON from LLM response (handles markdown fences, extra text)
+function extractJSON(text) {
+  // Try direct parse first
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    // ignore
+  }
+
+  // Remove markdown code fences
+  let cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+
+  // Try parsing the cleaned text
+  try {
+    return JSON.parse(cleaned.trim());
+  } catch (_) {
+    // ignore
+  }
+
+  // Try to find JSON object in the text
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  throw new Error('Could not extract valid JSON from LLM response');
+}
+
+// Helper function to extract text from PDF buffer
+async function extractTextFromPdf(buffer) {
+  const parser = new PDFParse({ data: buffer });
+  const data = await parser.getText();
+  await parser.destroy(); // Clean up resources
+  return data.text;
+}
+
+// Helper function to call Groq for resume parsing
+async function parseResumeWithGroq(resumeText) {
+  const systemPrompt = `You are a resume parsing assistant.
+Extract information from the resume and return ONLY a valid JSON object with these fields:
+- name (string)
+- email (string or null)
+- phone (string or null)
+- skills (array of strings)
+- education (array of strings)
+- experience (array of strings)
+- projects (array of strings)
+- certifications (array of strings)
+- achievements (array of strings)
+
+Rules:
+1. Extract only information explicitly present in the resume.
+2. Do not invent or assume information.
+3. If optional information is missing, use null.
+4. If a list-based field has no information, return an empty list.
+5. Keep the extracted information concise and relevant.
+6. Return ONLY valid JSON, no extra text.`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Parse the following resume:\n\n${resumeText}` },
+      ],
+      model: 'openai/gpt-oss-120b',
+      temperature: 0.1,
+    });
+
+    return extractJSON(completion.choices[0].message.content);
+  } catch (error) {
+    console.error('Error parsing resume with Groq:', error);
+    throw new Error('Failed to parse resume: ' + (error.message || 'Unknown error'));
+  }
+}
+
+// Helper function to call Groq for matching resume against job description
+async function matchResumeWithGroq(parsedResume, jobDescription) {
+  const systemPrompt = `You are an expert technical recruiter.
+Compare a candidate's resume against a job description and evaluate the match.
+The job description can be in any format - plain text, bullet points, paragraphs, etc. Just read and understand it.
+
+Return ONLY a valid JSON object with these fields:
+- score (integer 0-100)
+- matchedSkills (array of strings - skills the candidate has that match the job)
+- missingSkills (array of strings - skills required by the job that the candidate lacks)
+- strengths (array of strings - candidate's strong points for this role)
+- weaknesses (array of strings - areas where the candidate falls short)
+- explanation (string - detailed explanation of the score)
+
+Scoring guidelines:
+- 50%: Required technical skills
+- 20%: Relevant experience
+- 15%: Projects
+- 10%: Education
+- 5%: Certifications and other relevant qualifications
+
+Rules:
+1. Score the candidate from 0 to 100.
+2. Only use information explicitly present in the resume.
+3. Do not assume missing skills or experience.
+4. Match skills semantically when appropriate.
+5. Required skills are more important than preferred skills.
+6. Clearly identify matched and missing skills.
+7. Explain the main reasons behind the score.
+8. Return ONLY valid JSON, no extra text.`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: `Compare the candidate's resume with the following job requirements.
+
+JOB DESCRIPTION:
+${jobDescription}
+
+CANDIDATE RESUME:
+${JSON.stringify(parsedResume, null, 2)}
+
+Return the result as a JSON object ONLY.`,
+        },
+      ],
+      model: 'openai/gpt-oss-120b',
+      temperature: 0.1,
+    });
+
+    return extractJSON(completion.choices[0].message.content);
+  } catch (error) {
+    console.error('Error matching resume with Groq:', error);
+    throw new Error('Failed to match resume: ' + (error.message || 'Unknown error'));
+  }
+}
+
+// Routes
+app.post('/api/upload-resume', upload.single('resume'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No resume file uploaded' });
+    }
+
+    const jobDescription = req.body.jobDescription || '';
+    if (!jobDescription.trim()) {
+      return res.status(400).json({ error: 'Job description is required' });
+    }
+
+    console.log('Processing resume upload...');
+    console.log('Job description length:', jobDescription.length);
+
+    // Extract text from PDF
+    const resumeText = await extractTextFromPdf(req.file.buffer);
+    console.log('Resume text extracted, length:', resumeText.length);
+
+    // Parse resume using Groq
+    const parsedResume = await parseResumeWithGroq(resumeText);
+    console.log('Resume parsed successfully');
+
+    // Match resume against job description
+    const matchResult = await matchResumeWithGroq(parsedResume, jobDescription);
+    console.log('Match result:', matchResult.score);
+
+    // Determine eligibility (score >= 70)
+    const eligible = matchResult.score >= 70;
+
+    // Return result
+    res.json({
+      success: true,
+      data: {
+        resume: parsedResume,
+        match: {
+          ...matchResult,
+          eligible,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Error in upload-resume:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// Health check endpoint
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
