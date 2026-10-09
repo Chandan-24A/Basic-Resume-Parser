@@ -1,4 +1,4 @@
-# AI Resume Analyzer
+# AI Resume Parser
 
 A full-stack web application that uses AI to analyze resume compatibility with job descriptions. Built with React, Vite, Express, and the Groq API.
 
